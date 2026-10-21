@@ -1,10 +1,43 @@
+"""Evaluate prompting baselines (question_only / r1_zero / r1_zero_three_shot) on GSM8K.
+
+See the assignment handout, section 3.4.
+"""
+
 import argparse
 import json
+import math
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 from cs336_alignment.drgrpo_grader import question_only_reward_fn, r1_zero_reward_fn
-from cs336_alignment.vllm_utils import VLLMServer
+from cs336_alignment.vllm_utils import VLLMCompletion, VLLMServer
+
+# The keys that `vllm_utils.generate_completions` actually forwards to the server.
+# Anything else would be silently dropped, so we reject it up front.
+SUPPORTED_SAMPLING_KEYS = {
+    "temperature",
+    "max_tokens",
+    "n",
+    "seed",
+    "stop",
+    "include_stop_str_in_output",
+}
+
+
+def validate_sampling_params(sampling_params: dict[str, Any]) -> None:
+    """Fail loudly instead of letting unreachable parameters be ignored."""
+    unsupported = set(sampling_params) - SUPPORTED_SAMPLING_KEYS
+    if unsupported:
+        raise ValueError(
+            "vllm_utils.generate_completions only forwards "
+            f"{sorted(SUPPORTED_SAMPLING_KEYS)}; these would be ignored: {sorted(unsupported)}"
+        )
+    if sampling_params.get("n", 1) != 1:
+        raise ValueError(
+            "The prompting baseline samples one response per question, so n must be 1."
+        )
 
 
 def load_json(data_path: Path) -> list[dict[str, Any]]:
@@ -38,36 +71,70 @@ def build_prompts(questions: list[str], template: str) -> list[str]:
     return [template.format(question=question) for question in questions]
 
 
-def generate_responses(
+def generate_chunk_with_retry(
+    server: VLLMServer,
     prompts: list[str],
-    model_id: str,
-    gpu: int,
     sampling_params: dict[str, Any],
-    batch_size: int,
-    server: VLLMServer | None = None,
-) -> list[str]:
-    owns_server = server is None
-    if server is None:
-        server = VLLMServer(model_id=model_id, gpu=gpu, startup_timeout=600)
+    max_retries: int = 4,
+) -> list[VLLMCompletion]:
+    last_error: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return server.generate_completions(
+                prompts=prompts,
+                sampling_params=sampling_params,
+            )
+        except Exception as error:  # URLError / timeouts / transient server errors
+            last_error = error
+            if attempt < max_retries - 1:
+                time.sleep(2**attempt)  # 1s, 2s, 4s, 8s
+    assert last_error is not None
+    raise last_error
 
-    if owns_server:
-        server.start()
-    try:
-        completions = server.generate_completions(
-            prompts=prompts,
-            sampling_params=sampling_params,
-            batch_size=batch_size,
-        )
-    finally:
-        if owns_server:
-            server.stop()
 
+def generate_responses(
+    server: VLLMServer,
+    prompts: list[str],
+    sampling_params: dict[str, Any],
+    batch_size: int = 64,
+    workers: int = 4,
+    max_retries: int = 4,
+) -> list[VLLMCompletion]:
+    """Generate one completion per prompt, preserving prompt order."""
+    validate_sampling_params(sampling_params)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if workers <= 0:
+        raise ValueError("workers must be positive.")
+
+    chunks = [
+        prompts[start : start + batch_size]
+        for start in range(0, len(prompts), batch_size)
+    ]
+    ordered: list[list[VLLMCompletion] | None] = [None] * len(chunks)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(
+                generate_chunk_with_retry,
+                server,
+                chunk,
+                sampling_params,
+                max_retries,
+            ): index
+            for index, chunk in enumerate(chunks)
+        }
+        for future in as_completed(futures):
+            # Fill by chunk index: completion order is not chunk order.
+            ordered[futures[future]] = future.result()
+
+    completions = [completion for chunk in ordered if chunk for completion in chunk]
     if len(completions) != len(prompts):
         raise RuntimeError(
             f"Got {len(completions)} completions for {len(prompts)} prompts. "
             "Check that sampling_params['n'] == 1."
         )
-    return [completion.text for completion in completions]
+    return completions
 
 
 def score_zero_shot(responses: list[str], ground_truths: list[str]) -> list[dict[str, float]]:
@@ -98,16 +165,87 @@ def score_responses(
     raise ValueError(f"Unknown prompt_type: {prompt_type}")
 
 
-def summarize_scores(scores: list[dict[str, float]]) -> dict[str, int]:
-    counts = {"cnt11": 0, "cnt10": 0, "cnt00": 0}
+def summarize_scores(scores: list[dict[str, float]]) -> dict[str, float]:
+    """Count the four (format, answer) buckets.
+
+    Keys are "11", "10", "01", "00" for (format_reward, answer_reward).
+    """
+    if not scores:
+        raise ValueError("Cannot summarize an empty list of scores.")
+
+    counts = {"11": 0, "10": 0, "01": 0, "00": 0}
     for score in scores:
-        if score["format_reward"] == 1 and score["answer_reward"] == 1:
-            counts["cnt11"] += 1
-        elif score["format_reward"] == 1 and score["answer_reward"] == 0:
-            counts["cnt10"] += 1
-        elif score["format_reward"] == 0 and score["answer_reward"] == 0:
-            counts["cnt00"] += 1
-    return counts
+        key = f"{int(score['format_reward'])}{int(score['answer_reward'])}"
+        counts[key] += 1
+
+    total = len(scores)
+    assert sum(counts.values()) == total, "every score must land in exactly one bucket"
+
+    accuracy = sum(score["answer_reward"] for score in scores) / total
+    format_rate = sum(score["format_reward"] for score in scores) / total
+    # 95% half-width for a proportion (binomial normal approximation).
+    ci95 = 1.96 * math.sqrt(max(accuracy * (1.0 - accuracy), 0.0) / total)
+
+    return {
+        **counts,
+        "total": total,
+        "accuracy": accuracy,
+        "format_rate": format_rate,
+        "ci95": ci95,
+    }
+
+
+def dump_records(
+    path: Path,
+    prompt_type: str,
+    rows: list[dict[str, str]],
+    completions: list[VLLMCompletion],
+    scores: list[dict[str, float]],
+) -> None:
+    """Append one JSON line per example so the writeup does not need a re-run."""
+    with open(path, mode="a", encoding="utf-8") as file:
+        for row, completion, score in zip(rows, completions, scores):
+            file.write(
+                json.dumps(
+                    {
+                        "prompt_type": prompt_type,
+                        "question": row["question"],
+                        "ground_truth": row["ground_truth"],
+                        "response": completion.text,
+                        "finish_reason": completion.finish_reason,
+                        "reward": score["reward"],
+                        "format_reward": score["format_reward"],
+                        "answer_reward": score["answer_reward"],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+
+def report_summary(
+    prompt_type: str,
+    num_examples: int,
+    completions: list[VLLMCompletion],
+    summary: dict[str, float],
+) -> None:
+    print(f"\n=== {prompt_type} ({num_examples} examples) ===")
+    labels = {
+        "11": "format correct, answer correct",
+        "10": "format correct, answer incorrect",
+        "01": "format incorrect, answer correct",
+        "00": "format incorrect, answer incorrect",
+    }
+    for key, label in labels.items():
+        count = int(summary[key])
+        print(f"{label}: {count} ({100.0 * count / num_examples:.2f}%)")
+    print(
+        f"accuracy (mean answer_reward): {summary['accuracy']:.4f} "
+        f"± {summary['ci95']:.4f} (95% CI)"
+    )
+    print(f"format rate: {summary['format_rate']:.4f}")
+    truncated = sum(completion.finish_reason == "length" for completion in completions)
+    print(f"truncated (finish_reason == 'length'): {truncated} / {len(completions)}")
 
 
 def main():
@@ -133,7 +271,16 @@ def main():
     )
     parser.add_argument("--gpu", type=int, default=0, help="GPU index for vLLM.")
     parser.add_argument(
-        "--batch-size", type=int, default=8, help="Prompts per generation request."
+        "--batch-size", type=int, default=64, help="Prompts per generation request."
+    )
+    parser.add_argument(
+        "--workers", type=int, default=4, help="Concurrent generation requests."
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=4,
+        help="Retries per generation request before giving up.",
     )
     parser.add_argument(
         "--max-examples",
@@ -144,6 +291,12 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument(
+        "--dump-path",
+        type=Path,
+        default=Path("prompting_results.jsonl"),
+        help="Where to write per-example records (overwritten at start of run).",
+    )
     parser.add_argument(
         "--prompt-types",
         nargs="+",
@@ -161,6 +314,10 @@ def main():
 
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive.")
+    if args.workers <= 0:
+        parser.error("--workers must be positive.")
+    if args.max_retries <= 0:
+        parser.error("--max-retries must be positive.")
     if args.max_examples is not None and args.max_examples <= 0:
         parser.error("--max-examples must be positive when provided.")
     if args.examples_per_category < 0:
@@ -180,6 +337,10 @@ def main():
         "n": 1,
         "seed": args.seed,
     }
+
+    # Start a clean record file for this run.
+    args.dump_path.unlink(missing_ok=True)
+
     server = VLLMServer(
         model_id=args.model_id,
         gpu=args.gpu,
@@ -199,27 +360,20 @@ def main():
                 sampling_params["stop"] = ["</answer>"]
                 sampling_params["include_stop_str_in_output"] = True
 
-            responses = generate_responses(
+            completions = generate_responses(
+                server=server,
                 prompts=prompts,
-                model_id=args.model_id,
-                gpu=args.gpu,
                 sampling_params=sampling_params,
                 batch_size=args.batch_size,
-                server=server,
+                workers=args.workers,
+                max_retries=args.max_retries,
             )
+            responses = [completion.text for completion in completions]
             scores = score_responses(responses, ground_truths, prompt_type)
             summary = summarize_scores(scores)
+            dump_records(args.dump_path, prompt_type, rows, completions, scores)
 
-            print(f"\n=== {prompt_type} ({len(rows)} examples) ===")
-            category_labels = {
-                "cnt11": "format correct, answer correct",
-                "cnt10": "format correct, answer incorrect",
-                "cnt00": "format incorrect, answer reward 0",
-            }
-            for category, label in category_labels.items():
-                count = summary[category]
-                percentage = 100.0 * count / len(scores)
-                print(f"{label}: {count} ({percentage:.2f}%)")
+            report_summary(prompt_type, len(rows), completions, summary)
 
             category_specs = [
                 (
@@ -235,9 +389,15 @@ def main():
                     args.examples_per_category,
                 ),
                 (
-                    "format incorrect",
+                    "format incorrect, answer incorrect",
                     lambda score: score["format_reward"] == 0
                     and score["answer_reward"] == 0,
+                    args.examples_per_category,
+                ),
+                (
+                    "format incorrect, answer correct",
+                    lambda score: score["format_reward"] == 0
+                    and score["answer_reward"] == 1,
                     args.examples_per_category,
                 ),
             ]
@@ -252,8 +412,11 @@ def main():
                     print(f"Question: {rows[index]['question']}")
                     print(f"Prompt: {prompts[index]}")
                     print(f"Response: {responses[index]}")
+                    print(f"Finish reason: {completions[index].finish_reason}")
                     print(f"Ground truth: {ground_truths[index]}")
                     print(f"Score: {scores[index]}\n")
+
+        print(f"\nPer-example records written to {args.dump_path}")
     finally:
         server.stop()
 

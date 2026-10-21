@@ -10,6 +10,7 @@ def get_response_log_probs(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     return_token_entropy: bool,
+    need_grad: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Get per-token conditional log-probabilities (given the previous tokens)
     from a causal language model, and optionally the entropy of the model's
@@ -38,16 +39,27 @@ def get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    model.eval()
+    if not need_grad:
+        model.eval()
+        with torch.no_grad():
+            logits = model(input_ids).logits # b s v
+            log_logits = torch.nn.functional.log_softmax(logits, dim=-1)
+            log_probs = torch.gather(log_logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            result = {"log_probs": log_probs}
+            if return_token_entropy:
+                token_entropy = -torch.sum(torch.exp(log_logits) * log_logits, dim=-1)
+                result["token_entropy"] = token_entropy
+            return result
+    # model.eval()
     result = {}
-    with torch.no_grad():
-        logits = model(input_ids).logits # b s v
-        log_logits = torch.nn.functional.log_softmax(logits, dim=-1)
-        log_probs = torch.gather(log_logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-        result["log_probs"] = log_probs
-        if return_token_entropy:
-            token_entropy = -torch.sum(torch.exp(log_logits) * log_logits, dim=-1)
-            result["token_entropy"] = token_entropy
-            # -sum plogp 但是已经log_softmax了 所以要exp回去
+    # with torch.no_grad():
+    logits = model(input_ids).logits # b s v
+    log_logits = torch.nn.functional.log_softmax(logits, dim=-1)
+    log_probs = torch.gather(log_logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    result["log_probs"] = log_probs
+    if return_token_entropy:
+        token_entropy = -torch.sum(torch.exp(log_logits) * log_logits, dim=-1)
+        result["token_entropy"] = token_entropy
+        # -sum plogp 但是已经log_softmax了 所以要exp回去
     return result
         
