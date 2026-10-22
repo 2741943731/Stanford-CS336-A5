@@ -43,10 +43,20 @@ def grpo_train_step(
         advantage_normalizer)
     batch_size = len(repeated_promots)
     minibatch_size = batch_size // gradient_accumulation_steps
+    # tokenize_prompts / compute_rollout_rewards produce CPU tensors, while the
+    # policy may live on another device (e.g. cuda:7). Move the batch once here
+    # so every downstream op sees a consistent device.
+    device = next(model.parameters()).device
     input_ids, labels, response_mask = tokenize_prompts(
         repeated_promots,
         rollout_responses,
         tokenizer).values()
+    input_ids = input_ids.to(device)
+    labels = labels.to(device)
+    response_mask = response_mask.to(device)
+    normalized_rewards = normalized_rewards.to(device)
+    if old_log_probs is not None:
+        old_log_probs = old_log_probs.to(device)
     losses = []
     entropy_sum = 0.0
     entropy_tokens = 0.0
