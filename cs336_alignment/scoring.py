@@ -5,6 +5,22 @@ from transformers import PreTrainedTokenizerBase
 
 # 2026.10.17
 
+# Chunk size (in sequence positions) for the entropy computation. Entropy is a
+# logging metric, but the naive `-(p * log p).sum(-1)` allocates two extra
+# (batch, seq, vocab) tensors at full size, which is easily several GiB.
+_ENTROPY_CHUNK = 64
+
+
+def _token_entropy(log_logits: Tensor) -> Tensor:
+    """Per-token entropy over the vocabulary, chunked and without autograd."""
+    pieces = []
+    with torch.no_grad():
+        for start in range(0, log_logits.shape[1], _ENTROPY_CHUNK):
+            chunk = log_logits[:, start : start + _ENTROPY_CHUNK, :].detach()
+            pieces.append(-(chunk.exp() * chunk).sum(dim=-1))
+    return torch.cat(pieces, dim=1)
+
+
 def get_response_log_probs(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -40,26 +56,22 @@ def get_response_log_probs(
                 return_token_entropy=True).
     """
     if not need_grad:
-        model.eval()
         with torch.no_grad():
-            logits = model(input_ids).logits # b s v
+            logits = model(input_ids).logits  # b s v
             log_logits = torch.nn.functional.log_softmax(logits, dim=-1)
             log_probs = torch.gather(log_logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
             result = {"log_probs": log_probs}
             if return_token_entropy:
-                token_entropy = -torch.sum(torch.exp(log_logits) * log_logits, dim=-1)
-                result["token_entropy"] = token_entropy
+                result["token_entropy"] = _token_entropy(log_logits)
             return result
-    # model.eval()
+
     result = {}
-    # with torch.no_grad():
-    logits = model(input_ids).logits # b s v
+    logits = model(input_ids).logits  # b s v
     log_logits = torch.nn.functional.log_softmax(logits, dim=-1)
     log_probs = torch.gather(log_logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
     result["log_probs"] = log_probs
     if return_token_entropy:
-        token_entropy = -torch.sum(torch.exp(log_logits) * log_logits, dim=-1)
-        result["token_entropy"] = token_entropy
-        # -sum plogp 但是已经log_softmax了 所以要exp回去
+        # -sum p log p, where p = exp(log_logits); see _token_entropy for why
+        # this is chunked and detached from the autograd graph.
+        result["token_entropy"] = _token_entropy(log_logits)
     return result
-        

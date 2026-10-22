@@ -67,13 +67,18 @@ def grpo_train_step(
 
         minibatch_normalized_rewards = normalized_rewards[i: i + minibatch_size]
         minibatch_old_log_probs = old_log_probs[i: i + minibatch_size, :] if old_log_probs is not None else None
-        log_probs, token_entropy = get_response_log_probs(
-            model, 
-            minibatch_input_ids, 
-            minibatch_labels, 
-            return_token_entropy=True,
-            need_grad=True
-            ).values()
+        outputs = get_response_log_probs(
+            model,
+            minibatch_input_ids,
+            minibatch_labels,
+            # Entropy is only a logging metric, so compute it for the first
+            # microbatch only: the other 31 forwards then skip the extra
+            # (batch, seq, vocab) temporaries entirely.
+            return_token_entropy=(i == 0),
+            need_grad=True,
+        )
+        log_probs = outputs["log_probs"]
+        token_entropy = outputs.get("token_entropy")
         per_token_policy_gradient_loss, _ = compute_policy_gradient_loss(
             minibatch_normalized_rewards,
             log_probs, 

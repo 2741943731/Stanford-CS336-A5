@@ -1,11 +1,17 @@
 import argparse
 import json
 import math
+import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+
+# Must be set before torch initialises CUDA. Reduces fragmentation when the
+# allocator has to serve very different tensor sizes (vocab-sized logits vs.
+# small parameter updates).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -258,6 +264,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Trade compute for activation memory (big win on small GPUs).",
+    )
 
     # Sampling
     parser.add_argument("--sampling-temperature", type=float, default=1.0)
@@ -368,6 +379,14 @@ def main() -> None:
     torch.cuda.set_device(torch.device(args.policy_device))
     policy, tokenizer = get_model_and_tokenizer(args.model_id, args.policy_device)
     policy.train()
+    if args.gradient_checkpointing:
+        policy.gradient_checkpointing_enable()
+        print("[train] gradient checkpointing enabled (slower, less activation memory)")
+    first_param = next(policy.parameters())
+    print(
+        f"[train] policy dtype={first_param.dtype} device={first_param.device} "
+        f"params={sum(p.numel() for p in policy.parameters()) / 1e9:.2f}B"
+    )
     optimizer = torch.optim.AdamW(
         policy.parameters(),
         lr=args.learning_rate,
