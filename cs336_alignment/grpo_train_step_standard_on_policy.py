@@ -47,6 +47,9 @@ def grpo_train_step(
         repeated_promots,
         rollout_responses,
         tokenizer).values()
+    losses = []
+    entropy_sum = 0.0
+    entropy_tokens = 0.0
     for i in range(0, batch_size, minibatch_size):
         minibatch_input_ids = input_ids[i: i + minibatch_size, :]
         minibatch_labels = labels[i: i + minibatch_size, :]
@@ -54,13 +57,13 @@ def grpo_train_step(
 
         minibatch_normalized_rewards = normalized_rewards[i: i + minibatch_size]
         minibatch_old_log_probs = old_log_probs[i: i + minibatch_size, :] if old_log_probs is not None else None
-        log_probs = get_response_log_probs(
+        log_probs, token_entropy = get_response_log_probs(
             model, 
             minibatch_input_ids, 
             minibatch_labels, 
-            return_token_entropy=False,
+            return_token_entropy=True,
             need_grad=True
-            )["log_probs"]
+            ).values()
         per_token_policy_gradient_loss, _ = compute_policy_gradient_loss(
             minibatch_normalized_rewards,
             log_probs, 
@@ -74,12 +77,23 @@ def grpo_train_step(
             loss_normalization=loss_normalization,
             normalization_constant=normalization_constant
         )
+        losses.append(loss.item())
+        if token_entropy is not None:
+            entropy_sum += float((token_entropy.detach() * minibatch_response_mask).sum())
+            entropy_tokens += float(minibatch_response_mask.sum())
         if not normalization_constant:
             loss = loss / gradient_accumulation_steps
         batch_loss += loss
         loss.backward()
+    grad_norm = None
     if max_grad_norm is not None:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
     optimizer.step()
     optimizer.zero_grad()
-    return batch_loss, {}
+    return batch_loss, {"loss": batch_loss.item(), 
+                        "mean_reward": rollout_metadata["mean_reward"], 
+                        "mean_format_reward": rollout_metadata["mean_format_reward"], 
+                        **normalized_metadata, 
+                        "mean_loss": sum(losses) / len(losses),
+                        "grad_norm": float(grad_norm) if grad_norm is not None else float("nan"),
+                        "mean_entropy": entropy_sum / entropy_tokens if entropy_tokens else float("nan")}
